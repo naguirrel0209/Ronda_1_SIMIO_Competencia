@@ -11,8 +11,8 @@ This implementation focuses on four low-risk improvements:
 4. Berth priority based on useful discharged TEU per handling hour, favoring
    final deliveries and near-term connections while preventing starvation.
 
-It intentionally does not create alternative service routes. The default
-strategy can still create validated alternatives during active disruptions.
+Alternative routes are created conservatively only when a validated cycle is
+at least 15% faster and an empty vessel can be spared by the source route.
 """
 
 from dataclasses import dataclass
@@ -43,6 +43,8 @@ FINAL_DELIVERY_WEIGHT = 1.0
 NEAR_CONNECTION_WEIGHT = 0.65
 DELAYED_CONNECTION_WEIGHT = 0.25
 NEAR_CONNECTION_HOURS = 7.0 * 24.0
+MIN_ALTERNATIVE_ROUTE_IMPROVEMENT = 0.15
+MIN_SOURCE_ROUTE_VESSELS = 2
 
 
 @dataclass
@@ -201,12 +203,19 @@ class UserStrategy:
 
     @staticmethod
     def create_alternative_service_routes(context, now, vessel=None):
-        """ShippingLineResponseStrategy.
+        """Create only materially faster alternatives using an empty vessel."""
+        from response_strategies import default_strategy as fallback_routes
 
-        Do not create routes here. Returning ``None`` lets the validated default
-        implementation create active-disruption alternatives when appropriate.
-        """
-        return None
+        fallback_routes._restore_inactive_alternative_route_vessels(
+            context,
+            now,
+            vessel,
+        )
+        _ensure_conservative_alternative_routes(context, now, fallback_routes)
+        fallback_routes._try_switch_empty_vessel_to_pending_route(vessel)
+        # A non-None result prevents the unconditional fallback from creating
+        # routes that did not pass the conservative filters.
+        return True
 
     @staticmethod
     def assign_associated_bookings(context, now, shipment):
@@ -635,6 +644,210 @@ def _edge_capacity_pressure_hours(route, used_segments, booked_teu_by_segment):
         (booked_teu_by_segment.get(segment, 0.0) for segment in used_segments),
         default=0.0,
     )
+
+
+def _ensure_conservative_alternative_routes(context, now, fallback_routes):
+    close_plans, congested_plans = fallback_routes._get_active_disruption_plans(
+        context,
+        now,
+    )
+    avoid_port_names = fallback_routes._get_avoid_port_names(close_plans)
+    congested_leg_keys = {
+        fallback_routes._leg_key(plan.target_leg)
+        for plan in congested_plans
+        if plan.target_leg is not None
+    }
+    if not avoid_port_names and not congested_leg_keys:
+        return []
+
+    disruption_key = (
+        tuple(sorted(avoid_port_names)),
+        tuple(sorted(congested_leg_keys)),
+    )
+    alternatives = []
+    for source_route in list(context.initial_service_routes):
+        if len(source_route.deployed_vessels) < MIN_SOURCE_ROUTE_VESSELS:
+            continue
+        if not fallback_routes._service_route_is_disrupted(
+            source_route,
+            avoid_port_names,
+            congested_leg_keys,
+        ):
+            continue
+        if not _source_route_has_available_empty_vessel(source_route):
+            continue
+
+        alternative_route = next(
+            (
+                route
+                for route in context.service_routes
+                if route.source_service_route is source_route
+                and route.disruption_key == disruption_key
+            ),
+            None,
+        )
+        if alternative_route is None:
+            alternative_legs = _find_conservative_alternative_legs(
+                context,
+                source_route,
+                avoid_port_names,
+                congested_leg_keys,
+                fallback_routes,
+            )
+            if not alternative_legs:
+                continue
+            if not _alternative_cycle_is_materially_faster(
+                source_route,
+                alternative_legs,
+                close_plans,
+                congested_plans,
+                now,
+            ):
+                continue
+            alternative_route = fallback_routes._build_alternative_service_route(
+                context,
+                source_route,
+                avoid_port_names,
+                congested_leg_keys,
+                disruption_key,
+            )
+        if alternative_route is None:
+            continue
+
+        _reserve_one_empty_vessel(source_route, alternative_route)
+        alternatives.append(alternative_route)
+    return alternatives
+
+
+def _source_route_has_available_empty_vessel(source_route):
+    return any(
+        vessel.assigned_service_route is source_route
+        and vessel.pending_assigned_service_route is None
+        and not vessel.carried_shipments
+        for vessel in source_route.deployed_vessels
+    )
+
+
+def _find_conservative_alternative_legs(
+    context,
+    source_route,
+    avoid_port_names,
+    congested_leg_keys,
+    fallback_routes,
+):
+    source_segments = sorted(
+        source_route.segments,
+        key=lambda segment: segment.sequence_index,
+    )
+    anchor_ports = []
+    for segment in source_segments:
+        port = segment.associated_leg.departure_port
+        if port.name.casefold() in avoid_port_names:
+            continue
+        if not anchor_ports or anchor_ports[-1] is not port:
+            anchor_ports.append(port)
+    if len(anchor_ports) < 2:
+        return None
+
+    route_legs = []
+    for index, departure_port in enumerate(anchor_ports):
+        arrival_port = anchor_ports[(index + 1) % len(anchor_ports)]
+        leg_path = fallback_routes._find_shortest_leg_path(
+            context,
+            departure_port,
+            arrival_port,
+            avoid_port_names,
+            congested_leg_keys,
+        )
+        if not leg_path:
+            return None
+        route_legs.extend(leg_path)
+    return route_legs
+
+
+def _alternative_cycle_is_materially_faster(
+    source_route,
+    alternative_legs,
+    close_plans,
+    congested_plans,
+    now,
+):
+    speed = _route_average_speed(source_route)
+    normal_hours = sum(
+        float(segment.associated_leg.sailing_distance or 0) / speed
+        for segment in source_route.segments
+    )
+    disruption_hours = _source_route_disruption_delay_hours(
+        source_route,
+        close_plans,
+        congested_plans,
+        now,
+        speed,
+    )
+    default_hours = normal_hours + disruption_hours
+    alternative_hours = sum(
+        float(leg.sailing_distance or 0) / speed
+        for leg in alternative_legs
+    )
+    if default_hours <= 0:
+        return False
+    return alternative_hours <= default_hours * (
+        1.0 - MIN_ALTERNATIVE_ROUTE_IMPROVEMENT
+    )
+
+
+def _source_route_disruption_delay_hours(
+    source_route,
+    close_plans,
+    congested_plans,
+    now,
+    speed,
+):
+    route_legs = {segment.associated_leg for segment in source_route.segments}
+    route_ports = {
+        port
+        for leg in route_legs
+        for port in (leg.departure_port, leg.arrival_port)
+    }
+    delay_hours = 0.0
+    closure_ends = []
+    for plan in close_plans:
+        if plan.target_berth is None or plan.target_berth.port not in route_ports:
+            continue
+        end = dt.datetime.min + dt.timedelta(
+            days=plan.start_offset_days + plan.duration_days
+        )
+        closure_ends.append(max(0.0, (end - now).total_seconds() / 3600.0))
+    if closure_ends:
+        delay_hours += max(closure_ends)
+
+    for plan in congested_plans:
+        leg = plan.target_leg
+        if leg not in route_legs:
+            continue
+        base_hours = float(leg.sailing_distance or 0) / speed
+        delay_hours += base_hours * max(0.0, float(plan.multiplier or 1) - 1.0)
+    return delay_hours
+
+
+def _reserve_one_empty_vessel(source_route, alternative_route):
+    if alternative_route.deployed_vessels:
+        return
+    if any(
+        vessel.pending_assigned_service_route is alternative_route
+        for vessel in source_route.deployed_vessels
+    ):
+        return
+    candidates = sorted(source_route.deployed_vessels, key=lambda vessel: vessel.index)
+    for vessel in candidates:
+        if vessel.assigned_service_route is not source_route:
+            continue
+        if vessel.pending_assigned_service_route is not None:
+            continue
+        if vessel.carried_shipments:
+            continue
+        vessel.pending_assigned_service_route = alternative_route
+        return
     pressure_ratio = min(1.0, peak_booked_teu / total_capacity)
     return pressure_ratio * MAX_CAPACITY_PRESSURE_HOURS
 
