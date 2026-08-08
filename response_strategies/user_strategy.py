@@ -2,8 +2,8 @@
 
 This implementation focuses on four low-risk improvements:
 
-1. Preventive routing for shipments generated shortly before known
-   disruptions.
+1. Expected-time routing for every new shipment, with preventive avoidance
+   shortly before known disruptions.
 2. In-transit replanning for cargo whose remaining booking chain crosses an
    active or imminent disruption.
 3. Expected-time booking costs that include sailing, service frequency,
@@ -142,11 +142,11 @@ class UserStrategy:
 
     @staticmethod
     def assign_associated_bookings(context, now, shipment):
-        """Assign an initial booking chain that avoids near-term disruptions.
+        """Assign every initial booking using the lowest expected travel time.
 
-        The default strategy reacts once disruptions are active. This strategy
-        adds a preventive window so shipments generated shortly before a known
-        closure or congested leg avoid that risk when a viable path exists.
+        Sailing, next-vessel arrival, route pressure, transfers, and relevant
+        disruptions are evaluated throughout the full simulation. Preventive
+        hard avoidance remains limited to known disruption windows.
         """
         demand = shipment.demand
         origin_port = demand.origin_port
@@ -157,8 +157,6 @@ class UserStrategy:
             return True
 
         window = _get_disruption_window(context, now)
-        if not _has_preventive_work(window):
-            return None
 
         if origin_port.name.casefold() in window.active_closed_ports:
             return False
