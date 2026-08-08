@@ -28,6 +28,8 @@ DEFAULT_SAILING_SPEED_KNOTS = 18.0
 TRANSFER_PENALTY_HOURS = 48.0
 LARGE_SHIPMENT_TEU = 50.0
 LARGE_SHIPMENT_TRANSFER_MULTIPLIER = 2.0
+MIN_REBOOKING_IMPROVEMENT = 0.15
+LARGE_SHIPMENT_MIN_REBOOKING_IMPROVEMENT = 0.10
 IMMINENT_LEG_DELAY_HOURS = 14.0 * 24.0
 IMMINENT_PORT_DELAY_HOURS = 21.0 * 24.0
 ACTIVE_LEG_DELAY_HOURS = 45.0 * 24.0
@@ -247,6 +249,37 @@ class UserStrategy:
                     shipment_teu=shipment.teu_size,
                 )
             if not path:
+                continue
+
+            current_path = _build_remaining_booking_path(
+                shipment,
+                current_booking,
+                current_segment,
+                candidate_bookings,
+            )
+            if not current_path:
+                continue
+
+            current_cost = _booking_path_cost(
+                current_path,
+                final_port,
+                window,
+                shipment.teu_size,
+                current_route=current_booking.service_route,
+            )
+            alternative_cost = _booking_path_cost(
+                path,
+                final_port,
+                window,
+                shipment.teu_size,
+                current_route=current_booking.service_route,
+            )
+            required_improvement = (
+                LARGE_SHIPMENT_MIN_REBOOKING_IMPROVEMENT
+                if shipment.teu_size >= LARGE_SHIPMENT_TEU
+                else MIN_REBOOKING_IMPROVEMENT
+            )
+            if alternative_cost > current_cost * (1.0 - required_improvement):
                 continue
 
             _replace_unfinished_bookings_from_current_port(
@@ -609,6 +642,77 @@ def _edge_cost(edge, destination_port, window, shipment_teu=0):
             cost += IMMINENT_PORT_DELAY_HOURS
 
     return cost
+
+
+def _booking_path_cost(
+    path,
+    destination_port,
+    window,
+    shipment_teu,
+    current_route=None,
+):
+    cost = sum(
+        _edge_cost(edge, destination_port, window, shipment_teu)
+        for edge in path
+    )
+    if path and path[0].service_route is current_route:
+        transfer_multiplier = 1.0 + min(
+            LARGE_SHIPMENT_TRANSFER_MULTIPLIER - 1.0,
+            max(0.0, float(shipment_teu or 0) / LARGE_SHIPMENT_TEU),
+        )
+        cost -= path[0].expected_wait_hours
+        cost -= path[0].capacity_pressure_hours
+        cost -= TRANSFER_PENALTY_HOURS * transfer_multiplier
+    return max(0.0, cost)
+
+
+def _build_remaining_booking_path(
+    shipment,
+    current_booking,
+    current_segment,
+    candidate_edges,
+):
+    """Map the unfinished booking chain to comparable candidate edges."""
+    remaining = []
+    for booking in sorted(
+        shipment.associated_bookings,
+        key=lambda item: item.sequence_index,
+    ):
+        if booking.sequence_index < current_booking.sequence_index:
+            continue
+        if booking.service_route is None:
+            return None
+
+        departure_index = booking.departure_segment_index
+        if booking is current_booking:
+            if current_segment.sequence_index == booking.arrival_segment_index:
+                continue
+            segments = sorted(
+                booking.service_route.segments,
+                key=lambda segment: segment.sequence_index,
+            )
+            position = _find_segment_list_index(
+                segments,
+                current_segment.sequence_index,
+            )
+            if position < 0:
+                return None
+            departure_index = segments[(position + 1) % len(segments)].sequence_index
+
+        edge = next(
+            (
+                candidate
+                for candidate in candidate_edges
+                if candidate.service_route is booking.service_route
+                and candidate.departure_segment_index == departure_index
+                and candidate.arrival_segment_index == booking.arrival_segment_index
+            ),
+            None,
+        )
+        if edge is None:
+            return None
+        remaining.append(edge)
+    return remaining
 
 
 def _edge_ports(edge):
