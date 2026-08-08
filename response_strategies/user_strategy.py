@@ -165,7 +165,7 @@ class UserStrategy:
         if destination_port.name.casefold() in window.active_closed_ports:
             return False
 
-        candidate_bookings = _build_all_candidate_bookings(context)
+        candidate_bookings = _build_all_candidate_bookings(context, now)
         path = _find_lowest_cost_booking_path(
             context,
             origin_port,
@@ -206,7 +206,7 @@ class UserStrategy:
         if current_port is None:
             return None
 
-        candidate_bookings = _build_all_candidate_bookings(context)
+        candidate_bookings = _build_all_candidate_bookings(context, now)
         changed = False
 
         for shipment in list(vessel.carried_shipments):
@@ -317,15 +317,12 @@ def _has_preventive_work(window):
     )
 
 
-def _build_all_candidate_bookings(context):
+def _build_all_candidate_bookings(context, now):
     edges = []
     for service_route in context.service_routes:
         if not _route_has_available_vessel(service_route):
             continue
         route_speed = _route_average_speed(service_route)
-        expected_wait_hours = _route_expected_wait_hours(
-            service_route, route_speed
-        )
         capacity_pressure_hours = _route_capacity_pressure_hours(service_route)
         segments = sorted(
             service_route.segments,
@@ -337,6 +334,13 @@ def _build_all_candidate_bookings(context):
 
         for start_index in range(segment_count):
             departure_port = segments[start_index].associated_leg.departure_port
+            expected_wait_hours = _route_expected_wait_hours(
+                service_route,
+                segments,
+                start_index,
+                route_speed,
+                now,
+            )
             cumulative_distance = 0.0
             for step in range(1, segment_count):
                 segment_index = (start_index + step - 1) % segment_count
@@ -384,17 +388,100 @@ def _route_average_speed(route):
     return sum(positive_speeds) / len(positive_speeds)
 
 
-def _route_expected_wait_hours(route, route_speed):
-    """Estimate half a headway, the mean wait for an unscheduled arrival."""
-    vessel_count = len(route.deployed_vessels)
-    if vessel_count <= 0:
+def _route_expected_wait_hours(route, segments, departure_index, route_speed, now):
+    """Estimate the earliest vessel arrival at one route departure port.
+
+    Vessel positions provide a port-specific estimate. The half-headway is
+    retained only as a fallback for vessels that have not entered the route.
+    """
+    if not route.deployed_vessels:
         return math.inf
+
+    departure_port = segments[departure_index].associated_leg.departure_port
+    arrival_estimates = []
+    for vessel in route.deployed_vessels:
+        if vessel.assigned_service_route is not route:
+            continue
+
+        vessel_speed = float(
+            getattr(getattr(vessel, "vessel_class", None), "sailing_speed", 0) or 0
+        )
+        if vessel_speed <= 0:
+            vessel_speed = route_speed
+
+        if (
+            vessel.current_berth is not None
+            and vessel.current_berth.port is departure_port
+        ):
+            arrival_estimates.append(0.0)
+            continue
+
+        current_index = _segment_position_index(segments, vessel.current_segment)
+        if current_index >= 0:
+            include_current_leg = vessel.current_berth is None
+            arrival_estimates.append(
+                _hours_from_vessel_position_to_departure(
+                    segments,
+                    current_index,
+                    departure_index,
+                    vessel_speed,
+                    include_current_leg,
+                )
+            )
+
+    if arrival_estimates:
+        return min(arrival_estimates)
+
     cycle_distance = sum(
         float(getattr(segment.associated_leg, "sailing_distance", 0) or 0)
-        for segment in route.segments
+        for segment in segments
     )
-    cycle_hours = cycle_distance / route_speed
-    return cycle_hours / vessel_count / 2.0
+    half_headway = cycle_distance / route_speed / len(route.deployed_vessels) / 2.0
+    scheduled_wait = _hours_until_route_start(route, now)
+    return min(half_headway, scheduled_wait)
+
+
+def _segment_position_index(segments, current_segment):
+    if current_segment is None:
+        return -1
+    return next(
+        (index for index, segment in enumerate(segments) if segment is current_segment),
+        -1,
+    )
+
+
+def _hours_from_vessel_position_to_departure(
+    segments,
+    current_index,
+    departure_index,
+    vessel_speed,
+    include_current_leg,
+):
+    """Return sailing hours from a vessel's observed position to a port."""
+    hours = 0.0
+    if include_current_leg:
+        cursor = current_index
+        while True:
+            leg = segments[cursor].associated_leg
+            hours += float(getattr(leg, "sailing_distance", 0) or 0) / vessel_speed
+            cursor = (cursor + 1) % len(segments)
+            if cursor == departure_index:
+                break
+    else:
+        cursor = (current_index + 1) % len(segments)
+        while cursor != departure_index:
+            leg = segments[cursor].associated_leg
+            hours += float(getattr(leg, "sailing_distance", 0) or 0) / vessel_speed
+            cursor = (cursor + 1) % len(segments)
+    return hours
+
+
+def _hours_until_route_start(route, now):
+    current_day = now.weekday() + (
+        now.hour * 3600 + now.minute * 60 + now.second
+    ) / 86400.0
+    delay_days = (float(route.start_day_of_week) - current_day) % 7.0
+    return delay_days * 24.0
 
 
 def _route_capacity_pressure_hours(route):
