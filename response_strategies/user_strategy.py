@@ -1,11 +1,15 @@
 """Contestant response strategy.
 
-This implementation focuses on two low-risk improvements:
+This implementation focuses on four low-risk improvements:
 
 1. Preventive routing for shipments generated shortly before known
    disruptions.
 2. In-transit replanning for cargo whose remaining booking chain crosses an
    active or imminent disruption.
+3. Expected-time booking costs that include sailing, service frequency,
+   capacity pressure, transshipments, and disruption delays.
+4. Berth priority based on discharge relief, waiting time, carried TEU,
+   vessel capacity, and expected handling work.
 
 It intentionally does not create alternative service routes. The default
 strategy can still create validated alternatives during active disruptions.
@@ -20,10 +24,14 @@ from maritime_data_context import Booking
 
 LOOKAHEAD_DAYS = 50.0
 RECOVERY_BUFFER_DAYS = 3.0
-TRANSFER_PENALTY_NM = 900.0
-IMMINENT_LEG_PENALTY_NM = 12000.0
-IMMINENT_PORT_PENALTY_NM = 16000.0
-ACTIVE_LEG_PENALTY_NM = 50000.0
+DEFAULT_SAILING_SPEED_KNOTS = 18.0
+TRANSFER_PENALTY_HOURS = 48.0
+LARGE_SHIPMENT_TEU = 50.0
+LARGE_SHIPMENT_TRANSFER_MULTIPLIER = 2.0
+IMMINENT_LEG_DELAY_HOURS = 14.0 * 24.0
+IMMINENT_PORT_DELAY_HOURS = 21.0 * 24.0
+ACTIVE_LEG_DELAY_HOURS = 45.0 * 24.0
+MAX_CAPACITY_PRESSURE_HOURS = 7.0 * 24.0
 
 
 @dataclass
@@ -34,6 +42,9 @@ class _CandidateBookingEdge:
     departure_segment_index: int
     arrival_segment_index: int
     total_distance: float
+    sailing_hours: float
+    expected_wait_hours: float
+    capacity_pressure_hours: float
     segments: tuple
 
 
@@ -55,13 +66,70 @@ class UserStrategy:
         current_time,
         waiting_since_by_vessel=None,
     ):
-        """PortResponseStrategy.
+        """Select the vessel that releases the most useful cargo from queue."""
+        if not waiting_vessels:
+            return None
 
-        Return ``None`` so the default berth-priority strategy remains active.
-        The requested changes are focused on preventive routing and in-transit
-        replanning.
-        """
-        return None
+        waiting_since_by_vessel = waiting_since_by_vessel or {}
+
+        def waiting_hours(vessel):
+            waiting_since = waiting_since_by_vessel.get(vessel, current_time)
+            return max(0.0, (current_time - waiting_since).total_seconds() / 3600.0)
+
+        def shipment_teu(shipments):
+            return sum(getattr(shipment, "teu_size", 0) or 0 for shipment in shipments)
+
+        def discharging_teu(vessel):
+            try:
+                return shipment_teu(vessel.get_discharging_shipments_at_current_segment())
+            except (AttributeError, TypeError, ValueError):
+                return 0.0
+
+        def carried_teu(vessel):
+            return shipment_teu(getattr(vessel, "carried_shipments", []))
+
+        def vessel_capacity(vessel):
+            return getattr(getattr(vessel, "vessel_class", None), "teu_capacity", 0) or 0
+
+        def handling_workload(vessel):
+            try:
+                return discharging_teu(vessel) + shipment_teu(
+                    vessel.get_loading_shipments_at_next_segment()
+                )
+            except (AttributeError, TypeError, ValueError):
+                return discharging_teu(vessel)
+
+        def normalize(values):
+            minimum = min(values)
+            span = max(values) - minimum
+            if span == 0:
+                return [0.0] * len(values)
+            return [(value - minimum) / span for value in values]
+
+        discharge_scores = normalize([discharging_teu(v) for v in waiting_vessels])
+        waiting_scores = normalize([waiting_hours(v) for v in waiting_vessels])
+        carried_scores = normalize([carried_teu(v) for v in waiting_vessels])
+        capacity_scores = normalize([vessel_capacity(v) for v in waiting_vessels])
+        handling_scores = normalize([handling_workload(v) for v in waiting_vessels])
+
+        scores = [
+            0.35 * discharge
+            + 0.25 * waiting
+            + 0.20 * carried
+            + 0.10 * capacity
+            - 0.10 * handling
+            for discharge, waiting, carried, capacity, handling in zip(
+                discharge_scores,
+                waiting_scores,
+                carried_scores,
+                capacity_scores,
+                handling_scores,
+            )
+        ]
+        return max(
+            enumerate(waiting_vessels),
+            key=lambda item: (scores[item[0]], -item[0]),
+        )[1]
 
     @staticmethod
     def create_alternative_service_routes(context, now, vessel=None):
@@ -105,6 +173,7 @@ class UserStrategy:
             candidate_bookings,
             window,
             hard_avoid_preventive=True,
+            shipment_teu=shipment.teu_size,
         )
         if not path:
             path = _find_lowest_cost_booking_path(
@@ -114,6 +183,7 @@ class UserStrategy:
                 candidate_bookings,
                 window,
                 hard_avoid_preventive=False,
+                shipment_teu=shipment.teu_size,
             )
         if not path:
             return None
@@ -166,6 +236,7 @@ class UserStrategy:
                 candidate_bookings,
                 window,
                 hard_avoid_preventive=True,
+                shipment_teu=shipment.teu_size,
             )
             if not path:
                 path = _find_lowest_cost_booking_path(
@@ -175,6 +246,7 @@ class UserStrategy:
                     candidate_bookings,
                     window,
                     hard_avoid_preventive=False,
+                    shipment_teu=shipment.teu_size,
                 )
             if not path:
                 continue
@@ -250,6 +322,11 @@ def _build_all_candidate_bookings(context):
     for service_route in context.service_routes:
         if not _route_has_available_vessel(service_route):
             continue
+        route_speed = _route_average_speed(service_route)
+        expected_wait_hours = _route_expected_wait_hours(
+            service_route, route_speed
+        )
+        capacity_pressure_hours = _route_capacity_pressure_hours(service_route)
         segments = sorted(
             service_route.segments,
             key=lambda segment: segment.sequence_index,
@@ -281,6 +358,9 @@ def _build_all_candidate_bookings(context):
                         departure_segment_index=start_index + 1,
                         arrival_segment_index=segment_index + 1,
                         total_distance=cumulative_distance,
+                        sailing_hours=cumulative_distance / route_speed,
+                        expected_wait_hours=expected_wait_hours,
+                        capacity_pressure_hours=capacity_pressure_hours,
                         segments=used_segments,
                     )
                 )
@@ -293,6 +373,47 @@ def _route_has_available_vessel(route):
     return bool(route.deployed_vessels)
 
 
+def _route_average_speed(route):
+    speeds = [
+        float(getattr(getattr(vessel, "vessel_class", None), "sailing_speed", 0) or 0)
+        for vessel in route.deployed_vessels
+    ]
+    positive_speeds = [speed for speed in speeds if speed > 0]
+    if not positive_speeds:
+        return DEFAULT_SAILING_SPEED_KNOTS
+    return sum(positive_speeds) / len(positive_speeds)
+
+
+def _route_expected_wait_hours(route, route_speed):
+    """Estimate half a headway, the mean wait for an unscheduled arrival."""
+    vessel_count = len(route.deployed_vessels)
+    if vessel_count <= 0:
+        return math.inf
+    cycle_distance = sum(
+        float(getattr(segment.associated_leg, "sailing_distance", 0) or 0)
+        for segment in route.segments
+    )
+    cycle_hours = cycle_distance / route_speed
+    return cycle_hours / vessel_count / 2.0
+
+
+def _route_capacity_pressure_hours(route):
+    """Translate already-booked TEU per deployed slot into a bounded delay."""
+    total_capacity = sum(
+        float(getattr(getattr(vessel, "vessel_class", None), "teu_capacity", 0) or 0)
+        for vessel in route.deployed_vessels
+    )
+    if total_capacity <= 0:
+        return MAX_CAPACITY_PRESSURE_HOURS
+
+    booked_teu = sum(
+        float(getattr(getattr(booking, "shipment", None), "teu_size", 0) or 0)
+        for booking in route.associated_bookings
+    )
+    pressure_ratio = min(1.0, booked_teu / total_capacity)
+    return pressure_ratio * MAX_CAPACITY_PRESSURE_HOURS
+
+
 def _find_lowest_cost_booking_path(
     context,
     origin_port,
@@ -300,6 +421,7 @@ def _find_lowest_cost_booking_path(
     all_edges,
     window,
     hard_avoid_preventive,
+    shipment_teu=0,
 ):
     outgoing = {}
     for edge in all_edges:
@@ -324,7 +446,9 @@ def _find_lowest_cost_booking_path(
             next_port = edge.arrival_port
             if next_port not in unvisited:
                 continue
-            alternative = distances[current] + _edge_cost(edge, destination_port, window)
+            alternative = distances[current] + _edge_cost(
+                edge, destination_port, window, shipment_teu
+            )
             if alternative < distances[next_port]:
                 distances[next_port] = alternative
                 previous_edge[next_port] = edge
@@ -373,22 +497,31 @@ def _edge_is_blocked(edge, origin_port, destination_port, window, hard_avoid_pre
     return False
 
 
-def _edge_cost(edge, destination_port, window):
-    cost = edge.total_distance + TRANSFER_PENALTY_NM
+def _edge_cost(edge, destination_port, window, shipment_teu=0):
+    transfer_multiplier = 1.0 + min(
+        LARGE_SHIPMENT_TRANSFER_MULTIPLIER - 1.0,
+        max(0.0, float(shipment_teu or 0) / LARGE_SHIPMENT_TEU),
+    )
+    cost = (
+        edge.sailing_hours
+        + edge.expected_wait_hours
+        + edge.capacity_pressure_hours
+        + TRANSFER_PENALTY_HOURS * transfer_multiplier
+    )
 
     for segment in edge.segments:
         leg = segment.associated_leg
         if leg in window.active_congested_legs:
-            cost += ACTIVE_LEG_PENALTY_NM
+            cost += ACTIVE_LEG_DELAY_HOURS
         elif leg in window.preventive_congested_legs:
-            cost += IMMINENT_LEG_PENALTY_NM
+            cost += IMMINENT_LEG_DELAY_HOURS
 
     for port in _edge_ports(edge):
         if port is destination_port:
             continue
         name = port.name.casefold()
         if name in window.preventive_closed_ports:
-            cost += IMMINENT_PORT_PENALTY_NM
+            cost += IMMINENT_PORT_DELAY_HOURS
 
     return cost
 
