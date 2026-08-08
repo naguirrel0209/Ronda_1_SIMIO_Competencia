@@ -8,8 +8,8 @@ This implementation focuses on four low-risk improvements:
    active or imminent disruption.
 3. Expected-time booking costs that include sailing, service frequency,
    capacity pressure, transshipments, and disruption delays.
-4. Berth priority based on discharge relief, waiting time, carried TEU,
-   vessel capacity, and expected handling work.
+4. Berth priority based on discharged TEU per handling hour, with waiting-time
+   protection against starvation.
 
 It intentionally does not create alternative service routes. The default
 strategy can still create validated alternatives during active disruptions.
@@ -34,6 +34,11 @@ IMMINENT_LEG_DELAY_HOURS = 14.0 * 24.0
 IMMINENT_PORT_DELAY_HOURS = 21.0 * 24.0
 ACTIVE_LEG_DELAY_HOURS = 45.0 * 24.0
 MAX_CAPACITY_PRESSURE_HOURS = 7.0 * 24.0
+BERTH_PRODUCTIVITY_WEIGHT = 0.70
+BERTH_WAITING_WEIGHT = 0.30
+BERTH_STARVATION_LIMIT_HOURS = 7.0 * 24.0
+QUAY_CRANE_TEU_PER_HOUR = 45.0
+MINIMUM_HANDLING_HOURS = 0.25
 
 
 @dataclass
@@ -68,7 +73,7 @@ class UserStrategy:
         current_time,
         waiting_since_by_vessel=None,
     ):
-        """Select the vessel that releases the most useful cargo from queue."""
+        """Select the vessel releasing the most TEU per berth-hour."""
         if not waiting_vessels:
             return None
 
@@ -87,19 +92,24 @@ class UserStrategy:
             except (AttributeError, TypeError, ValueError):
                 return 0.0
 
-        def carried_teu(vessel):
-            return shipment_teu(getattr(vessel, "carried_shipments", []))
-
-        def vessel_capacity(vessel):
-            return getattr(getattr(vessel, "vessel_class", None), "teu_capacity", 0) or 0
-
-        def handling_workload(vessel):
+        def loading_teu(vessel):
             try:
-                return discharging_teu(vessel) + shipment_teu(
-                    vessel.get_loading_shipments_at_next_segment()
-                )
+                return shipment_teu(vessel.get_loading_shipments_at_next_segment())
             except (AttributeError, TypeError, ValueError):
-                return discharging_teu(vessel)
+                return 0.0
+
+        def handling_hours(vessel):
+            vessel_class = getattr(vessel, "vessel_class", None)
+            loa = float(getattr(vessel_class, "loa", 0) or 0)
+            crane_count = max(1, int(loa / 55.0))
+            handled_teu = discharging_teu(vessel) + loading_teu(vessel)
+            return max(
+                MINIMUM_HANDLING_HOURS,
+                handled_teu / (crane_count * QUAY_CRANE_TEU_PER_HOUR),
+            )
+
+        def discharge_productivity(vessel):
+            return discharging_teu(vessel) / handling_hours(vessel)
 
         def normalize(values):
             minimum = min(values)
@@ -108,25 +118,22 @@ class UserStrategy:
                 return [0.0] * len(values)
             return [(value - minimum) / span for value in values]
 
-        discharge_scores = normalize([discharging_teu(v) for v in waiting_vessels])
-        waiting_scores = normalize([waiting_hours(v) for v in waiting_vessels])
-        carried_scores = normalize([carried_teu(v) for v in waiting_vessels])
-        capacity_scores = normalize([vessel_capacity(v) for v in waiting_vessels])
-        handling_scores = normalize([handling_workload(v) for v in waiting_vessels])
+        waits = [waiting_hours(vessel) for vessel in waiting_vessels]
+        oldest_wait = max(waits)
+        if oldest_wait >= BERTH_STARVATION_LIMIT_HOURS:
+            return max(
+                enumerate(waiting_vessels),
+                key=lambda item: (waits[item[0]], -item[0]),
+            )[1]
 
+        productivity_scores = normalize(
+            [discharge_productivity(vessel) for vessel in waiting_vessels]
+        )
+        waiting_scores = normalize(waits)
         scores = [
-            0.35 * discharge
-            + 0.25 * waiting
-            + 0.20 * carried
-            + 0.10 * capacity
-            - 0.10 * handling
-            for discharge, waiting, carried, capacity, handling in zip(
-                discharge_scores,
-                waiting_scores,
-                carried_scores,
-                capacity_scores,
-                handling_scores,
-            )
+            BERTH_PRODUCTIVITY_WEIGHT * productivity
+            + BERTH_WAITING_WEIGHT * waiting
+            for productivity, waiting in zip(productivity_scores, waiting_scores)
         ]
         return max(
             enumerate(waiting_vessels),
