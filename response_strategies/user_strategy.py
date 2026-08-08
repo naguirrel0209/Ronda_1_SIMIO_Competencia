@@ -8,8 +8,8 @@ This implementation focuses on four low-risk improvements:
    active or imminent disruption.
 3. Expected-time booking costs that include sailing, service frequency,
    capacity pressure, transshipments, and disruption delays.
-4. Berth priority based on discharged TEU per handling hour, with waiting-time
-   protection against starvation.
+4. Berth priority based on useful discharged TEU per handling hour, favoring
+   final deliveries and near-term connections while preventing starvation.
 
 It intentionally does not create alternative service routes. The default
 strategy can still create validated alternatives during active disruptions.
@@ -39,6 +39,10 @@ BERTH_WAITING_WEIGHT = 0.30
 BERTH_STARVATION_LIMIT_HOURS = 7.0 * 24.0
 QUAY_CRANE_TEU_PER_HOUR = 45.0
 MINIMUM_HANDLING_HOURS = 0.25
+FINAL_DELIVERY_WEIGHT = 1.0
+NEAR_CONNECTION_WEIGHT = 0.65
+DELAYED_CONNECTION_WEIGHT = 0.25
+NEAR_CONNECTION_HOURS = 7.0 * 24.0
 
 
 @dataclass
@@ -73,7 +77,7 @@ class UserStrategy:
         current_time,
         waiting_since_by_vessel=None,
     ):
-        """Select the vessel releasing the most TEU per berth-hour."""
+        """Select the vessel releasing the most useful TEU per berth-hour."""
         if not waiting_vessels:
             return None
 
@@ -108,8 +112,63 @@ class UserStrategy:
                 handled_teu / (crane_count * QUAY_CRANE_TEU_PER_HOUR),
             )
 
+        def connection_weight(shipment):
+            demand = getattr(shipment, "demand", None)
+            if demand is not None and demand.destination_port is port:
+                return FINAL_DELIVERY_WEIGHT
+
+            try:
+                current_booking = shipment.get_current_booking()
+            except (AttributeError, ValueError):
+                return DELAYED_CONNECTION_WEIGHT
+
+            next_booking = next(
+                (
+                    booking
+                    for booking in shipment.associated_bookings
+                    if booking.sequence_index == current_booking.sequence_index + 1
+                ),
+                None,
+            )
+            if next_booking is None or next_booking.service_route is None:
+                return DELAYED_CONNECTION_WEIGHT
+
+            route = next_booking.service_route
+            segments = sorted(
+                route.segments,
+                key=lambda segment: segment.sequence_index,
+            )
+            departure_index = _find_segment_list_index(
+                segments,
+                next_booking.departure_segment_index,
+            )
+            if departure_index < 0:
+                return DELAYED_CONNECTION_WEIGHT
+
+            connection_wait = _route_expected_wait_hours(
+                route,
+                segments,
+                departure_index,
+                _route_average_speed(route),
+                current_time,
+            )
+            if connection_wait <= NEAR_CONNECTION_HOURS:
+                return NEAR_CONNECTION_WEIGHT
+            return DELAYED_CONNECTION_WEIGHT
+
+        def useful_discharging_teu(vessel):
+            try:
+                shipments = vessel.get_discharging_shipments_at_current_segment()
+            except (AttributeError, TypeError, ValueError):
+                return 0.0
+            return sum(
+                float(getattr(shipment, "teu_size", 0) or 0)
+                * connection_weight(shipment)
+                for shipment in shipments
+            )
+
         def discharge_productivity(vessel):
-            return discharging_teu(vessel) / handling_hours(vessel)
+            return useful_discharging_teu(vessel) / handling_hours(vessel)
 
         def normalize(values):
             minimum = min(values)
