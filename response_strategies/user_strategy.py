@@ -3,7 +3,7 @@
 This implementation focuses on four low-risk improvements:
 
 1. Expected-time routing for every new shipment, with preventive avoidance
-   shortly before known disruptions.
+   and arrival-aware handling of temporarily closed destinations.
 2. In-transit replanning for cargo whose remaining booking chain crosses an
    active or imminent disruption.
 3. Expected-time booking costs that include sailing, service frequency,
@@ -228,8 +228,6 @@ class UserStrategy:
 
         if origin_port.name.casefold() in window.active_closed_ports:
             return False
-        if destination_port.name.casefold() in window.active_closed_ports:
-            return False
 
         candidate_bookings = _build_all_candidate_bookings(context, now)
         path = _find_lowest_cost_booking_path(
@@ -253,6 +251,14 @@ class UserStrategy:
             )
         if not path:
             return None
+        if _path_arrives_during_destination_closure(
+            context,
+            now,
+            destination_port,
+            path,
+            shipment.teu_size,
+        ):
+            return False
 
         _assign_booking_path(shipment, path)
         return True
@@ -703,7 +709,7 @@ def _edge_is_blocked(edge, origin_port, destination_port, window, hard_avoid_pre
     ports_to_check = _edge_ports(edge)
     for port in ports_to_check:
         name = port.name.casefold()
-        if name in active_closed:
+        if name in active_closed and port is not destination_port:
             return True
         if (
             hard_avoid_preventive
@@ -765,6 +771,49 @@ def _booking_path_cost(
         cost -= path[0].capacity_pressure_hours
         cost -= TRANSFER_PENALTY_HOURS * transfer_multiplier
     return max(0.0, cost)
+
+
+def _path_arrives_during_destination_closure(
+    context,
+    now,
+    destination_port,
+    path,
+    shipment_teu,
+):
+    """Return whether the expected destination arrival falls inside a closure."""
+    arrival_time = now + dt.timedelta(
+        hours=_expected_path_elapsed_hours(path, shipment_teu)
+    )
+    for plan in context.disruption_plans:
+        if not plan.close_berth or plan.target_berth is None:
+            continue
+        if plan.target_berth.port is not destination_port:
+            continue
+        if plan.start_offset_days is None or plan.duration_days is None:
+            continue
+        closure_start = dt.datetime.min + dt.timedelta(days=plan.start_offset_days)
+        closure_end = closure_start + dt.timedelta(days=plan.duration_days)
+        if closure_start <= arrival_time < closure_end:
+            return True
+    return False
+
+
+def _expected_path_elapsed_hours(path, shipment_teu):
+    """Estimate physical travel and connection time without avoidance penalties."""
+    transfer_multiplier = 1.0 + min(
+        LARGE_SHIPMENT_TRANSFER_MULTIPLIER - 1.0,
+        max(0.0, float(shipment_teu or 0) / LARGE_SHIPMENT_TEU),
+    )
+    elapsed = 0.0
+    previous_route = None
+    for edge in path:
+        elapsed += edge.sailing_hours
+        elapsed += edge.expected_wait_hours
+        elapsed += edge.capacity_pressure_hours
+        if previous_route is not None and edge.service_route is not previous_route:
+            elapsed += TRANSFER_PENALTY_HOURS * transfer_multiplier
+        previous_route = edge.service_route
+    return elapsed
 
 
 def _build_remaining_booking_path(
