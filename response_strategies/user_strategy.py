@@ -22,16 +22,20 @@ import math
 from maritime_data_context import Booking
 
 
-LOOKAHEAD_DAYS = 50.0
+# Calibrated against the supplied demand matrix and vessel classes. Generated
+# shipment means range from 0.011 to 1.895 TEU, and every vessel class sails at
+# 20 knots. A 30-day lookahead covers the longest normal ocean legs without
+# diverting cargo almost two months before a disruption.
+LOOKAHEAD_DAYS = 30.0
 RECOVERY_BUFFER_DAYS = 3.0
-DEFAULT_SAILING_SPEED_KNOTS = 18.0
+DEFAULT_SAILING_SPEED_KNOTS = 20.0
 TRANSFER_PENALTY_HOURS = 48.0
-LARGE_SHIPMENT_TEU = 50.0
-LARGE_SHIPMENT_TRANSFER_MULTIPLIER = 2.0
+LARGE_SHIPMENT_TEU = 2.0
+LARGE_SHIPMENT_TRANSFER_MULTIPLIER = 1.5
 IMMINENT_LEG_DELAY_HOURS = 14.0 * 24.0
 IMMINENT_PORT_DELAY_HOURS = 21.0 * 24.0
 ACTIVE_LEG_DELAY_HOURS = 45.0 * 24.0
-MAX_CAPACITY_PRESSURE_HOURS = 7.0 * 24.0
+MAX_CAPACITY_PRESSURE_HOURS = 3.0 * 24.0
 
 
 @dataclass
