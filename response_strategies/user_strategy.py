@@ -7,7 +7,7 @@ This implementation focuses on four low-risk improvements:
 2. In-transit replanning for cargo whose remaining booking chain crosses an
    active or imminent disruption.
 3. Expected-time booking costs that include sailing, service frequency,
-   capacity pressure, transshipments, and disruption delays.
+   segment-specific capacity pressure, transshipments, and disruption delays.
 4. Berth priority based on useful discharged TEU per handling hour, favoring
    final deliveries and near-term connections while preventing starvation.
 
@@ -420,7 +420,6 @@ def _build_all_candidate_bookings(context, now):
         if not _route_has_available_vessel(service_route):
             continue
         route_speed = _route_average_speed(service_route)
-        capacity_pressure_hours = _route_capacity_pressure_hours(service_route)
         segments = sorted(
             service_route.segments,
             key=lambda segment: segment.sequence_index,
@@ -428,6 +427,10 @@ def _build_all_candidate_bookings(context, now):
         segment_count = len(segments)
         if segment_count < 2:
             continue
+        booked_teu_by_segment = _route_booked_teu_by_segment(
+            service_route,
+            segments,
+        )
 
         for start_index in range(segment_count):
             departure_port = segments[start_index].associated_leg.departure_port
@@ -461,7 +464,11 @@ def _build_all_candidate_bookings(context, now):
                         total_distance=cumulative_distance,
                         sailing_hours=cumulative_distance / route_speed,
                         expected_wait_hours=expected_wait_hours,
-                        capacity_pressure_hours=capacity_pressure_hours,
+                        capacity_pressure_hours=_edge_capacity_pressure_hours(
+                            service_route,
+                            used_segments,
+                            booked_teu_by_segment,
+                        ),
                         segments=used_segments,
                     )
                 )
@@ -581,8 +588,36 @@ def _hours_until_route_start(route, now):
     return delay_days * 24.0
 
 
-def _route_capacity_pressure_hours(route):
-    """Translate already-booked TEU per deployed slot into a bounded delay."""
+def _route_booked_teu_by_segment(route, segments):
+    """Count only unfinished bookings on the route segments they still use."""
+    booked_teu = {segment: 0.0 for segment in segments}
+    for booking in route.associated_bookings:
+        shipment = getattr(booking, "shipment", None)
+        if shipment is None or shipment.completion_time is not None:
+            continue
+        current_booking_index = getattr(shipment, "current_booking_index", None)
+        if current_booking_index is None or booking.sequence_index < current_booking_index:
+            continue
+
+        start_index = _find_segment_list_index(
+            segments,
+            booking.departure_segment_index,
+        )
+        end_index = _find_segment_list_index(
+            segments,
+            booking.arrival_segment_index,
+        )
+        if start_index < 0 or end_index < 0:
+            continue
+
+        teu = float(getattr(shipment, "teu_size", 0) or 0)
+        for segment in _iter_segments_between(segments, start_index, end_index):
+            booked_teu[segment] += teu
+    return booked_teu
+
+
+def _edge_capacity_pressure_hours(route, used_segments, booked_teu_by_segment):
+    """Penalize an edge according to its busiest unfinished segment."""
     total_capacity = sum(
         float(getattr(getattr(vessel, "vessel_class", None), "teu_capacity", 0) or 0)
         for vessel in route.deployed_vessels
@@ -590,11 +625,11 @@ def _route_capacity_pressure_hours(route):
     if total_capacity <= 0:
         return MAX_CAPACITY_PRESSURE_HOURS
 
-    booked_teu = sum(
-        float(getattr(getattr(booking, "shipment", None), "teu_size", 0) or 0)
-        for booking in route.associated_bookings
+    peak_booked_teu = max(
+        (booked_teu_by_segment.get(segment, 0.0) for segment in used_segments),
+        default=0.0,
     )
-    pressure_ratio = min(1.0, booked_teu / total_capacity)
+    pressure_ratio = min(1.0, peak_booked_teu / total_capacity)
     return pressure_ratio * MAX_CAPACITY_PRESSURE_HOURS
 
 
