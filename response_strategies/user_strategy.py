@@ -1,10 +1,12 @@
 """Contestant response strategy.
 
-This implementation focuses on two low-risk improvements:
+This implementation focuses on three low-risk improvements:
 
-1. Preventive routing for shipments generated shortly before known
+1. Time-aware booking, using estimated sailing time, route frequency, and
+   transshipment delay instead of pure nautical distance.
+2. Preventive routing for shipments generated shortly before known
    disruptions.
-2. In-transit replanning for cargo whose remaining booking chain crosses an
+3. In-transit replanning for cargo whose remaining booking chain crosses an
    active or imminent disruption.
 
 It intentionally does not create alternative service routes. The default
@@ -20,10 +22,11 @@ from maritime_data_context import Booking
 
 LOOKAHEAD_DAYS = 50.0
 RECOVERY_BUFFER_DAYS = 3.0
-TRANSFER_PENALTY_NM = 900.0
-IMMINENT_LEG_PENALTY_NM = 12000.0
-IMMINENT_PORT_PENALTY_NM = 16000.0
-ACTIVE_LEG_PENALTY_NM = 50000.0
+TRANSFER_PENALTY_HOURS = 36.0
+IMMINENT_LEG_PENALTY_HOURS = 240.0
+IMMINENT_PORT_PENALTY_HOURS = 336.0
+ACTIVE_LEG_PENALTY_HOURS = 720.0
+MIN_ROUTE_WAIT_HOURS = 6.0
 
 
 @dataclass
@@ -41,8 +44,16 @@ class _CandidateBookingEdge:
 class _DisruptionWindow:
     active_closed_ports: object
     preventive_closed_ports: object
-    active_congested_legs: object
-    preventive_congested_legs: object
+    active_congested_leg_multipliers: object
+    preventive_congested_leg_multipliers: object
+
+    @property
+    def active_congested_legs(self):
+        return set(self.active_congested_leg_multipliers)
+
+    @property
+    def preventive_congested_legs(self):
+        return set(self.preventive_congested_leg_multipliers)
 
 
 class UserStrategy:
@@ -74,11 +85,11 @@ class UserStrategy:
 
     @staticmethod
     def assign_associated_bookings(context, now, shipment):
-        """Assign an initial booking chain that avoids near-term disruptions.
+        """Assign an initial booking chain by estimated real time.
 
-        The default strategy reacts once disruptions are active. This strategy
-        adds a preventive window so shipments generated shortly before a known
-        closure or congested leg avoid that risk when a viable path exists.
+        The default strategy uses distance-based shortest paths. This strategy
+        adds route frequency, vessel speed, transshipment delay, and disruption
+        penalties so the booking chain reflects expected elapsed time better.
         """
         demand = shipment.demand
         origin_port = demand.origin_port
@@ -89,9 +100,6 @@ class UserStrategy:
             return True
 
         window = _get_disruption_window(context, now)
-        if not _has_preventive_work(window):
-            return None
-
         if origin_port.name.casefold() in window.active_closed_ports:
             return False
         if destination_port.name.casefold() in window.active_closed_ports:
@@ -104,7 +112,7 @@ class UserStrategy:
             destination_port,
             candidate_bookings,
             window,
-            hard_avoid_preventive=True,
+            hard_avoid_preventive=_has_preventive_work(window),
         )
         if not path:
             path = _find_lowest_cost_booking_path(
@@ -193,8 +201,8 @@ class UserStrategy:
 def _get_disruption_window(context, now):
     active_closed_ports = set()
     preventive_closed_ports = set()
-    active_congested_legs = set()
-    preventive_congested_legs = set()
+    active_congested_leg_multipliers = {}
+    preventive_congested_leg_multipliers = {}
 
     for plan in context.disruption_plans:
         if plan.start_offset_days is None or plan.duration_days is None:
@@ -224,15 +232,15 @@ def _get_disruption_window(context, now):
 
         if plan.multiplier > 1 and plan.target_leg is not None:
             if active:
-                active_congested_legs.add(plan.target_leg)
+                active_congested_leg_multipliers[plan.target_leg] = plan.multiplier
             else:
-                preventive_congested_legs.add(plan.target_leg)
+                preventive_congested_leg_multipliers[plan.target_leg] = plan.multiplier
 
     return _DisruptionWindow(
         active_closed_ports,
         preventive_closed_ports,
-        active_congested_legs,
-        preventive_congested_legs,
+        active_congested_leg_multipliers,
+        preventive_congested_leg_multipliers,
     )
 
 
@@ -240,8 +248,8 @@ def _has_preventive_work(window):
     return bool(
         window.active_closed_ports
         or window.preventive_closed_ports
-        or window.active_congested_legs
-        or window.preventive_congested_legs
+        or window.active_congested_leg_multipliers
+        or window.preventive_congested_leg_multipliers
     )
 
 
@@ -374,23 +382,85 @@ def _edge_is_blocked(edge, origin_port, destination_port, window, hard_avoid_pre
 
 
 def _edge_cost(edge, destination_port, window):
-    cost = edge.total_distance + TRANSFER_PENALTY_NM
+    cost = _route_expected_wait_hours(edge.service_route, window)
+    cost += TRANSFER_PENALTY_HOURS
+    cost += _edge_sailing_hours(edge, window)
 
     for segment in edge.segments:
         leg = segment.associated_leg
-        if leg in window.active_congested_legs:
-            cost += ACTIVE_LEG_PENALTY_NM
-        elif leg in window.preventive_congested_legs:
-            cost += IMMINENT_LEG_PENALTY_NM
+        if leg in window.active_congested_leg_multipliers:
+            cost += ACTIVE_LEG_PENALTY_HOURS
+        elif leg in window.preventive_congested_leg_multipliers:
+            cost += IMMINENT_LEG_PENALTY_HOURS
 
     for port in _edge_ports(edge):
         if port is destination_port:
             continue
         name = port.name.casefold()
         if name in window.preventive_closed_ports:
-            cost += IMMINENT_PORT_PENALTY_NM
+            cost += IMMINENT_PORT_PENALTY_HOURS
 
     return cost
+
+
+def _edge_sailing_hours(edge, window):
+    speed = _route_average_speed_knots(edge.service_route)
+    if speed <= 0:
+        return math.inf
+
+    hours = 0.0
+    for segment in edge.segments:
+        leg = segment.associated_leg
+        multiplier = _leg_time_multiplier(leg, window)
+        hours += leg.sailing_distance / speed * multiplier
+    return hours
+
+
+def _route_expected_wait_hours(route, window):
+    deployed_vessels = max(1, len(getattr(route, "deployed_vessels", []) or []))
+    cycle_hours = _route_cycle_hours(route, window)
+    if not math.isfinite(cycle_hours) or cycle_hours <= 0:
+        return MIN_ROUTE_WAIT_HOURS
+    return max(MIN_ROUTE_WAIT_HOURS, cycle_hours / deployed_vessels / 2.0)
+
+
+def _route_cycle_hours(route, window):
+    speed = _route_average_speed_knots(route)
+    if speed <= 0:
+        return math.inf
+
+    hours = 0.0
+    for segment in route.segments:
+        leg = segment.associated_leg
+        if leg is None:
+            continue
+        hours += leg.sailing_distance / speed * _leg_time_multiplier(leg, window)
+    return hours
+
+
+def _route_average_speed_knots(route):
+    vessels = getattr(route, "deployed_vessels", []) or []
+    speeds = [
+        vessel.vessel_class.sailing_speed
+        for vessel in vessels
+        if getattr(vessel, "vessel_class", None) is not None
+        and vessel.vessel_class.sailing_speed > 0
+    ]
+    if speeds:
+        return sum(speeds) / len(speeds)
+
+    source_route = getattr(route, "source_service_route", None)
+    if source_route is not None:
+        return _route_average_speed_knots(source_route)
+    return 20.0
+
+
+def _leg_time_multiplier(leg, window):
+    if leg in window.active_congested_leg_multipliers:
+        return window.active_congested_leg_multipliers[leg]
+    if leg in window.preventive_congested_leg_multipliers:
+        return window.preventive_congested_leg_multipliers[leg]
+    return getattr(leg, "sailing_time_multiplier", 1.0) or 1.0
 
 
 def _edge_ports(edge):
